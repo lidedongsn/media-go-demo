@@ -1,4 +1,4 @@
-module golang-demo
+module github.com/lidedongsn/media-go-demo
 
 go 1.24.0
 
