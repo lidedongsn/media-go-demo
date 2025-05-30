@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/binary"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"net"
@@ -16,13 +18,29 @@ import (
 const (
 	port     = 9000
 	ssrc     = 1234
+	rtxSSRC  = 4321
 	mtu      = 1500
-	lossRate = 0.2 // 丢包概率
+	lossRate = 0.2
+
+	originalPayloadType = 96
+	rtxPayloadType      = 98
 )
 
 func main() {
 	go sender()
 	receiver()
+}
+
+func unwrapRTX(pkt *rtp.Packet) (*rtp.Packet, error) {
+	if len(pkt.Payload) < 2 {
+		return nil, fmt.Errorf("invalid RTX payload")
+	}
+	origSeq := binary.BigEndian.Uint16(pkt.Payload[:2])
+	pkt.Payload = pkt.Payload[2:]
+	pkt.PayloadType = originalPayloadType
+	pkt.SSRC = ssrc
+	pkt.SequenceNumber = origSeq
+	return pkt, nil
 }
 
 func receiver() {
@@ -31,45 +49,40 @@ func receiver() {
 	if err != nil {
 		panic(err)
 	}
-
 	defer conn.Close()
 
-	// NACK 生成器
 	nackGenFactory, _ := nack.NewGeneratorInterceptor()
 	nackGen, _ := nackGenFactory.NewInterceptor("")
 
-	// JitterBuffer + Pop 控制
-	jb := jitterbuffer.New(jitterbuffer.WithMinimumPacketCount(3))
-	// jbInterceptorFactory, _ := jitterbuffer.NewInterceptor()
-	// jbInterceptor, _ := jbInterceptorFactory.NewInterceptor("")
+	jbInterceptorFactory, _ := jitterbuffer.NewInterceptor()
+	jbInterceptor, _ := jbInterceptorFactory.NewInterceptor("")
 
-	// chain := interceptor.NewChain([]interceptor.Interceptor{jbInterceptor, nackGen})
-	chain := interceptor.NewChain([]interceptor.Interceptor{nackGen})
-
+	chain := interceptor.NewChain([]interceptor.Interceptor{nackGen, jbInterceptor})
 	rtcpWriterSet := false
+
 	remote := chain.BindRemoteStream(&interceptor.StreamInfo{
 		SSRC:         ssrc,
 		RTCPFeedback: []interceptor.RTCPFeedback{{Type: "nack"}},
 	}, interceptor.RTPReaderFunc(func(b []byte, _ interceptor.Attributes) (int, interceptor.Attributes, error) {
 		p := &rtp.Packet{}
-		_ = p.Unmarshal(b)
-		jb.Push(p)
-
-		return len(b), nil, nil
-	}))
-
-	go func() {
-		// time.Sleep(30 * time.Millisecond)
-		for {
-			pkt, err := jb.Pop()
-			if err != nil {
-				time.Sleep(5 * time.Millisecond)
-				continue
-			}
-			log.Printf("✅ Pop sorted RTP Seq=%d", pkt.SequenceNumber)
+		if err := p.Unmarshal(b); err != nil {
+			log.Printf("❌ Failed to unmarshal RTP: %v", err)
+			return 0, nil, err
 		}
 
-	}()
+		if p.PayloadType == rtxPayloadType {
+			log.Printf("📥 Received RTX packet Seq=%d", p.SequenceNumber)
+			p, err = unwrapRTX(p)
+			if err != nil {
+				log.Printf("❌ unwrap RTX failed: %v", err)
+				return 0, nil, err
+			}
+			log.Printf("✅ Unwrapped to original RTP Seq=%d", p.SequenceNumber)
+		} else {
+			log.Printf("📨 Received RTP Seq=%d", p.SequenceNumber)
+		}
+		return len(b), nil, nil
+	}))
 
 	buf := make([]byte, mtu)
 	for {
@@ -89,8 +102,8 @@ func receiver() {
 					return 0, err
 				}
 				for _, pkt := range pkts {
-					if _, ok := pkt.(*rtcp.TransportLayerNack); ok {
-						log.Printf("📨 Send NACK: %+v", pkt)
+					if nackPkt, ok := pkt.(*rtcp.TransportLayerNack); ok {
+						log.Printf("📨 Send NACK: %+v", nackPkt)
 					}
 				}
 				return conn.WriteTo(raw, addr)
@@ -99,8 +112,29 @@ func receiver() {
 	}
 }
 
+func buildRTXPacket(orig []byte, origSeq uint16, origHeader *rtp.Header) ([]byte, error) {
+	headerBytes, err := origHeader.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	rtxHeader := &rtp.Header{
+		Version:        2,
+		PayloadType:    rtxPayloadType,
+		SequenceNumber: origHeader.SequenceNumber,
+		SSRC:           rtxSSRC,
+	}
+	rtxHeaderBytes, err := rtxHeader.Marshal()
+	if err != nil {
+		return nil, err
+	}
+
+	// 添加原始序列号 + 原始 payload（跳过 RTP Header 部分）
+	payload := append([]byte{byte(origSeq >> 8), byte(origSeq & 0xFF)}, orig[len(headerBytes):]...)
+	return append(rtxHeaderBytes, payload...), nil
+}
+
 func sender() {
-	time.Sleep(1 * time.Second) // 等待接收端准备好
+	time.Sleep(1 * time.Second)
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
 	conn, err := net.DialUDP("udp", nil, addr)
@@ -112,9 +146,10 @@ func sender() {
 	nackResponderFactory, _ := nack.NewResponderInterceptor()
 	nackResponder, _ := nackResponderFactory.NewInterceptor("")
 	chain := interceptor.NewChain([]interceptor.Interceptor{nackResponder})
-	var seq uint16 = 0
+
+	var seq uint16 = 100
 	sentPkts := make(map[uint16][]byte)
-	// RTCP Reader 处理 NACK
+
 	rtcpReader := chain.BindRTCPReader(interceptor.RTCPReaderFunc(func(in []byte, _ interceptor.Attributes) (int, interceptor.Attributes, error) {
 		pkts, err := rtcp.Unmarshal(in)
 		if err != nil {
@@ -124,15 +159,20 @@ func sender() {
 			if nackPkt, ok := pkt.(*rtcp.TransportLayerNack); ok {
 				for _, pair := range nackPkt.Nacks {
 					log.Printf("🔁 Got NACK for Seq=%d", pair.PacketID)
-
-					// 根据 NACK 请求重传丢失的包
-					if lostPkt, exists := sentPkts[pair.PacketID]; exists {
-						_, err := conn.Write(lostPkt)
+					if origPkt, exists := sentPkts[pair.PacketID]; exists {
+						origHeader := &rtp.Header{}
+						_, err := origHeader.Unmarshal(origPkt)
 						if err != nil {
-							log.Printf("failed to resend packet with Seq=%d: %v", pair.PacketID, err)
-						} else {
-							log.Printf("📤 Resent RTP Seq=%d", pair.PacketID)
+							log.Printf("❌ Failed to parse RTP header: %v", err)
+							continue
 						}
+						rtxPkt, err := buildRTXPacket(origPkt, pair.PacketID, origHeader)
+						if err != nil {
+							log.Printf("❌ Failed to build RTX: %v", err)
+							continue
+						}
+						conn.Write(rtxPkt)
+						log.Printf("📤 Resent RTX packet for Seq=%d", pair.PacketID)
 					}
 				}
 			}
@@ -141,10 +181,10 @@ func sender() {
 	}))
 
 	go func() {
-		rtcpBuf := make([]byte, mtu)
+		buf := make([]byte, mtu)
 		for {
-			n, _ := conn.Read(rtcpBuf)
-			rtcpReader.Read(rtcpBuf[:n], nil)
+			n, _ := conn.Read(buf)
+			rtcpReader.Read(buf[:n], nil)
 		}
 	}()
 
@@ -157,24 +197,26 @@ func sender() {
 	}))
 
 	for {
-		h := &rtp.Header{Version: 2, SSRC: ssrc, SequenceNumber: seq}
+		h := &rtp.Header{
+			Version:        2,
+			SSRC:           ssrc,
+			PayloadType:    originalPayloadType,
+			SequenceNumber: seq,
+		}
 		payload := []byte{0x01, 0x02}
-
 		hb, err := h.Marshal()
 		if err != nil {
-			log.Printf("failed to marshal RTP header: %v", err)
 			continue
 		}
 		fullPkt := append(hb, payload...)
 		sentPkts[seq] = fullPkt
 
 		if rand.Float64() > lossRate {
-			_, _ = stream.Write(h, payload, nil)
+			stream.Write(h, payload, nil)
 			log.Printf("📤 Sent RTP Seq=%d", seq)
 		} else {
 			log.Printf("❌ Drop RTP Seq=%d", seq)
 		}
-
 		seq++
 		time.Sleep(50 * time.Millisecond)
 	}
